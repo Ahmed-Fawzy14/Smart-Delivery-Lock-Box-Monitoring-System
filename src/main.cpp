@@ -7,13 +7,14 @@
 #include <RTClib.h>
 #include <time.h>
 
-//config
+// ─── CONFIG ───────────────────────────────────────────
 const char* WIFI_SSID     = "malek";
 const char* WIFI_PASSWORD = "malek2004";
 const char* SERVER_URL    = "https://server-smart-delivery-systme-production.up.railway.app/upload";
 const char* TZ_INFO       = "EET-2EEST,M4.5.5/0,M10.5.4/24";
+// ──────────────────────────────────────────────────────
 
-//ESP32-CAM pin def
+// ESP32-CAM AI-Thinker pin definitions
 #define PWDN_GPIO_NUM     32
 #define RESET_GPIO_NUM    -1
 #define XCLK_GPIO_NUM      0
@@ -31,30 +32,40 @@ const char* TZ_INFO       = "EET-2EEST,M4.5.5/0,M10.5.4/24";
 #define HREF_GPIO_NUM     23
 #define PCLK_GPIO_NUM     22
 
-//RTC I2C pins
+// ─── DS3231 RTC I2C PINS ──────────────────────────────
 #define RTC_SDA_PIN 14
 #define RTC_SCL_PIN 15
+// ──────────────────────────────────────────────────────
 
-//user I/O
+// ─── USER I/O ─────────────────────────────────────────
 #define FLASH_LED_PIN 4
 #define TRIGGER_PIN   13
+// ──────────────────────────────────────────────────────
 
-//RTOS
-static QueueHandle_t     frameQueue;
-static SemaphoreHandle_t uploadBusy; // taken while upload is in progress
-
-//frame pointer & timestamp
-typedef struct {
-    camera_fb_t* fb;
-    char timestamp[24];
-} FramePacket;
+// ─── LATCH RELAY ──────────────────────────────────────
+#define LATCH_RELAY_PIN    12
+#define RELAY_ACTIVE_LEVEL HIGH
+#define RELAY_IDLE_LEVEL   LOW
+#define LATCH_OPEN_MS      10000
+// ──────────────────────────────────────────────────────
 
 RTC_DS3231 rtc;
 bool rtcAvailable = false;
 
-// Latch state: true --> trigger already fired, wait for removal
-static bool triggerFired = false;
+// Trigger debounce
+bool lastTriggerReading    = false;
+bool debouncedTriggerState = false;
+unsigned long lastDebounceTime = 0;
+const unsigned long debounceDelayMs = 50;
 
+// Latch state
+bool latchIsOpen = false;
+unsigned long latchOpenedAt = 0;
+
+// Shared flag between tasks — volatile so both cores see updates
+volatile bool waitingForCommand = false;
+
+// ─── CAMERA ───────────────────────────────────────────
 bool initCamera() {
     camera_config_t config;
     config.ledc_channel = LEDC_CHANNEL_0;
@@ -90,7 +101,7 @@ bool initCamera() {
     return true;
 }
 
-
+// ─── WIFI ─────────────────────────────────────────────
 bool connectWiFi() {
     Serial.printf("Connecting to %s", WIFI_SSID);
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
@@ -111,7 +122,35 @@ bool connectWiFi() {
     return false;
 }
 
+bool ensureWiFiConnected() {
+    if (WiFi.status() == WL_CONNECTED) return true;
 
+    Serial.println("WiFi disconnected. Reconnecting...");
+    WiFi.disconnect(true);
+    delay(500);
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+    int attempts = 0;
+    while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+        delay(500);
+        Serial.print(".");
+        attempts++;
+    }
+    Serial.println();
+
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.printf("WiFi reconnected! IP: %s\n", WiFi.localIP().toString().c_str());
+        WiFi.setSleep(false);
+        return true;
+    }
+
+    Serial.println("WiFi reconnect failed. Restarting...");
+    delay(5000);
+    ESP.restart();
+    return false;
+}
+
+// ─── NTP ──────────────────────────────────────────────
 bool syncTimeFromNTP() {
     Serial.println("Starting NTP time sync...");
     configTzTime(TZ_INFO, "pool.ntp.org", "time.nist.gov");
@@ -135,14 +174,15 @@ bool syncTimeFromNTP() {
     return true;
 }
 
+// ─── RTC ──────────────────────────────────────────────
 bool initRTC() {
     Wire.begin(RTC_SDA_PIN, RTC_SCL_PIN);
     if (!rtc.begin(&Wire)) {
-        Serial.println("DS3231 not found!");
+        Serial.println("DS3231 not found on I2C bus!");
         return false;
     }
     DateTime now = rtc.now();
-    Serial.printf("RTC time: %04d-%02d-%02d %02d:%02d:%02d\n",
+    Serial.printf("RTC current time: %04d-%02d-%02d %02d:%02d:%02d\n",
                   now.year(), now.month(), now.day(),
                   now.hour(), now.minute(), now.second());
     return true;
@@ -151,7 +191,7 @@ bool initRTC() {
 bool updateRTCFromNTP() {
     struct tm timeinfo;
     if (!getLocalTime(&timeinfo)) {
-        Serial.println("Cannot update RTC: NTP not available.");
+        Serial.println("Cannot update RTC: NTP time not available.");
         return false;
     }
     DateTime ntpTime(
@@ -167,7 +207,6 @@ bool updateRTCFromNTP() {
     return true;
 }
 
-// return timestamp string from RTC at the moment of call
 String getTimestamp() {
     if (!rtcAvailable) return "no-rtc";
     DateTime now = rtc.now();
@@ -178,164 +217,176 @@ String getTimestamp() {
     return String(buf);
 }
 
-//trigger latch
-//fires once when 5V connected, reset when 5V removed
+// ─── TRIGGER ──────────────────────────────────────────
+void initTriggerInput() {
+    pinMode(TRIGGER_PIN, INPUT_PULLDOWN);
+}
+
 bool triggerPressedEvent() {
-    bool currentReading = (digitalRead(TRIGGER_PIN) == HIGH);
+    bool reading = (digitalRead(TRIGGER_PIN) == HIGH);
 
-    if (currentReading == true && triggerFired == false) {
-        triggerFired = true;
-        return true;
+    if (reading != lastTriggerReading) {
+        lastDebounceTime = millis();
     }
 
-    if (currentReading == false) {
-        triggerFired = false;
+    if ((millis() - lastDebounceTime) > debounceDelayMs) {
+        if (reading != debouncedTriggerState) {
+            debouncedTriggerState = reading;
+            if (debouncedTriggerState == true) {
+                lastTriggerReading = reading;
+                return true;
+            }
+        }
     }
 
+    lastTriggerReading = reading;
     return false;
 }
 
-//TASK 1: TRIGGER TASK (Core 1)
-// detects trigger, check upload is free, captures, push to queue
-void triggerTask(void* pvParameters) {
-    Serial.println("[TriggerTask] Started. Waiting for trigger...");
+// ─── LATCH ────────────────────────────────────────────
+void initLatch() {
+    digitalWrite(LATCH_RELAY_PIN, RELAY_IDLE_LEVEL);
+    pinMode(LATCH_RELAY_PIN, OUTPUT);
+    digitalWrite(LATCH_RELAY_PIN, RELAY_IDLE_LEVEL);
+    latchIsOpen = false;
+}
+
+void openLatch() {
+    Serial.printf("Opening latch for %lu ms...\n", (unsigned long)LATCH_OPEN_MS);
+    digitalWrite(LATCH_RELAY_PIN, RELAY_ACTIVE_LEVEL);
+    latchIsOpen = true;
+    latchOpenedAt = millis();
+}
+
+void closeLatch() {
+    digitalWrite(LATCH_RELAY_PIN, RELAY_IDLE_LEVEL);
+    latchIsOpen = false;
+    Serial.println("Latch closed.");
+}
+
+void serviceLatch() {
+    if (latchIsOpen && (millis() - latchOpenedAt >= LATCH_OPEN_MS)) {
+        closeLatch();
+    }
+}
+
+// ─── CAPTURE & SEND ───────────────────────────────────
+bool captureAndSend() {
+    if (!ensureWiFiConnected()) return false;
+
+    String timestamp = getTimestamp();
+    Serial.printf("[%s] Capturing image...\n", timestamp.c_str());
+
+    digitalWrite(FLASH_LED_PIN, HIGH);
+    delay(150);
+    camera_fb_t* fb = esp_camera_fb_get();
+    digitalWrite(FLASH_LED_PIN, LOW);
+
+    if (!fb) {
+        Serial.println("Camera capture failed");
+        return false;
+    }
+
+    Serial.printf("Captured image: %d bytes\n", fb->len);
+
+    WiFiClientSecure client;
+    client.setInsecure();
+
+    HTTPClient http;
+    http.begin(client, SERVER_URL);
+    http.addHeader("Content-Type", "image/jpeg");
+    http.addHeader("X-Timestamp", timestamp);
+    http.setTimeout(30000);
+
+    int httpCode = http.POST(fb->buf, fb->len);
+
+    bool success = false;
+    if (httpCode == 200) {
+        Serial.printf("Image sent successfully! [%s]\n", timestamp.c_str());
+        success = true;
+    } else if (httpCode > 0) {
+        Serial.printf("HTTP POST failed, code: %d\n", httpCode);
+    } else {
+        Serial.printf("HTTP POST error: %s\n", http.errorToString(httpCode).c_str());
+    }
+
+    http.end();
+    esp_camera_fb_return(fb);
+
+    if (success) {
+        Serial.println("[Command] Waiting for decision...");
+        waitingForCommand = true;  // signal poll task to start
+    }
+
+    return success;
+}
+
+// ─── TASK 1: CAMERA + TRIGGER (Core 1, High Priority) ─
+void cameraTask(void* pvParameters) {
+    Serial.println("[CameraTask] Started.");
 
     for (;;) {
+        serviceLatch();
+
         if (triggerPressedEvent()) {
-            Serial.println("[TriggerTask] Trigger detected.");
-
-            //check if upload task is still busy 
-            if (xSemaphoreTake(uploadBusy, 0) != pdTRUE) {
-                // Upload still running --> buffer not free yet — skip entirely
-                Serial.println("[TriggerTask] Upload in progress. Skipping.");
-            } else {
-                // uploadBusy was free --> give it back immediately
-                xSemaphoreGive(uploadBusy);
-
-                Serial.println("[TriggerTask] Capturing...");
-                digitalWrite(FLASH_LED_PIN, HIGH);
-                delay(50);
-                camera_fb_t* fb = esp_camera_fb_get();
-                digitalWrite(FLASH_LED_PIN, LOW);
-
-                if (fb == NULL) {
-                    Serial.println("[TriggerTask] Capture failed.");
-                } else {
-                    Serial.printf("[TriggerTask] Captured %d bytes.\n", fb->len);
-
-                    //stamp time at capture moment
-                    FramePacket packet;
-                    packet.fb = fb;
-                    String ts = getTimestamp();
-                    strncpy(packet.timestamp, ts.c_str(), sizeof(packet.timestamp) - 1);
-                    packet.timestamp[sizeof(packet.timestamp) - 1] = '\0';
-
-                    if (xQueueSend(frameQueue, &packet, pdMS_TO_TICKS(500)) != pdTRUE) {
-                        // Queue full
-                        Serial.println("[TriggerTask] Queue full! Discarding frame.");
-                        esp_camera_fb_return(fb);
-                    } else {
-                        Serial.println("[TriggerTask] Frame queued.");
-                    }
-                }
-            }
+            Serial.println("[CameraTask] Trigger detected.");
+            waitingForCommand = false;  // cancel any old poll
+            lastTriggerReading = false;
+            debouncedTriggerState = false;
+            captureAndSend();
         }
 
         vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
 
-//TASK 2: UPLOAD TASK (Core 0)
-//wait for frames, upoad over HTTPS, free buffer
-void uploadTask(void* pvParameters) {
-    Serial.println("[UploadTask] Started. Waiting for frames...");
+// ─── TASK 2: COMMAND POLLING (Core 0, Low Priority) ───
+void pollTask(void* pvParameters) {
+    Serial.println("[PollTask] Started.");
 
     for (;;) {
-        FramePacket packet;
+        if (waitingForCommand) {
+            if (ensureWiFiConnected()) {
+                Serial.println("[PollTask] Checking for decision...");
 
-        // Blocks here consuming zero CPU until a frame arrives
-        if (xQueueReceive(frameQueue, &packet, portMAX_DELAY) == pdTRUE) {
-            if (packet.fb == NULL) {
-                Serial.println("[UploadTask] NULL frame, skipping.");
-                continue;
+                WiFiClientSecure client;
+                client.setInsecure();
+
+                HTTPClient http;
+                http.begin(client, "https://server-smart-delivery-systme-production.up.railway.app/command");
+                http.setTimeout(3000);
+
+                int httpCode = http.GET();
+
+                if (httpCode == 200) {
+                    String payload = http.getString();
+                    payload.trim();
+                    Serial.printf("[PollTask] Received: %s\n", payload.c_str());
+
+                    if (payload == "true") {
+                        Serial.println("[PollTask] Unlock command received!");
+                        openLatch();
+                        waitingForCommand = false;
+                    } else if (payload == "false") {
+                        Serial.println("[PollTask] Deny command received.");
+                        waitingForCommand = false;
+                    } else {
+                        Serial.println("[PollTask] No decision yet...");
+                    }
+                } else {
+                    Serial.printf("[PollTask] HTTP error: %d\n", httpCode);
+                }
+
+                http.end();
             }
-
-            // Mark upload as busy — trigger task will not fire flash while this is held
-            xSemaphoreTake(uploadBusy, portMAX_DELAY);
-
-            String timestamp = String(packet.timestamp);
-            Serial.printf("[UploadTask] Uploading [%s] (%d bytes)...\n",
-                          timestamp.c_str(), packet.fb->len);
-
-            WiFiClientSecure client;
-            client.setInsecure(); // skip SSL cert verification
-
-            HTTPClient http;
-            http.begin(client, SERVER_URL);
-            http.addHeader("Content-Type", "image/jpeg");
-            http.addHeader("X-Timestamp", timestamp);
-            http.setTimeout(15000);
-
-            int httpCode = http.POST(packet.fb->buf, packet.fb->len);
-
-            if (httpCode == 200) {
-                Serial.printf("[UploadTask] Success! [%s]\n", timestamp.c_str());
-            } else if (httpCode > 0) {
-                Serial.printf("[UploadTask] HTTP error: %d\n", httpCode);
-            } else {
-                Serial.printf("[UploadTask] Connection error: %s\n",
-                              http.errorToString(httpCode).c_str());
-            }
-
-            http.end();
-
-            // Free the buffer before releasing the semaphore
-            esp_camera_fb_return(packet.fb);
-            Serial.println("[UploadTask] Buffer released.");
-
-            // Mark upload as free — trigger task can now capture again
-            xSemaphoreGive(uploadBusy);
-        }
-    }
-}
-
-//TASK 3: WIFI WATCHDOG (Core 0)
-//check WiFi every 30s, reconnect if dropped
-void wifiWatchdogTask(void* pvParameters) {
-    Serial.println("[WiFiWatchdog] Started.");
-
-    for (;;) {
-        vTaskDelay(pdMS_TO_TICKS(30000));
-
-        if (WiFi.status() != WL_CONNECTED) {
-            Serial.println("[WiFiWatchdog] WiFi lost. Reconnecting...");
-            WiFi.disconnect(true);
-            delay(500);
-            WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-
-            int attempts = 0;
-            while (WiFi.status() != WL_CONNECTED && attempts < 20) {
-                delay(500);
-                Serial.print(".");
-                attempts++;
-            }
-            Serial.println();
-
-            if (WiFi.status() == WL_CONNECTED) {
-                WiFi.setSleep(false);
-                Serial.printf("[WiFiWatchdog] Reconnected! IP: %s\n",
-                              WiFi.localIP().toString().c_str());
-            } else {
-                Serial.println("[WiFiWatchdog] Failed. Restarting...");
-                delay(1000);
-                ESP.restart();
-            }
+            vTaskDelay(pdMS_TO_TICKS(2000));
         } else {
-            Serial.println("[WiFiWatchdog] WiFi OK.");
+            vTaskDelay(pdMS_TO_TICKS(100));
         }
     }
 }
 
+// ─── SETUP ────────────────────────────────────────────
 void setup() {
     Serial.begin(115200);
     delay(1000);
@@ -343,23 +394,25 @@ void setup() {
 
     pinMode(FLASH_LED_PIN, OUTPUT);
     digitalWrite(FLASH_LED_PIN, LOW);
-    pinMode(TRIGGER_PIN, INPUT_PULLDOWN);
+
+    initLatch();
+    initTriggerInput();
 
     rtcAvailable = initRTC();
     if (!rtcAvailable) {
-        Serial.println("RTC error. Restarting...");
+        Serial.println("RTC error. Restarting in 10 seconds...");
         delay(10000);
         ESP.restart();
     }
 
     if (!initCamera()) {
-        Serial.println("Camera error. Restarting...");
+        Serial.println("Camera error. Restarting in 10 seconds...");
         delay(10000);
         ESP.restart();
     }
 
     if (!connectWiFi()) {
-        Serial.println("WiFi error. Restarting...");
+        Serial.println("WiFi error. Restarting in 10 seconds...");
         delay(10000);
         ESP.restart();
     }
@@ -368,27 +421,20 @@ void setup() {
     if (syncTimeFromNTP()) {
         updateRTCFromNTP();
     } else {
-        Serial.println("WARNING: NTP failed. Using existing RTC time.");
+        Serial.println("WARNING: NTP sync failed. Using RTC's existing time.");
     }
 
-    //rtos primitives
-    frameQueue  = xQueueCreate(1, sizeof(FramePacket));
-    uploadBusy  = xSemaphoreCreateBinary();
-    xSemaphoreGive(uploadBusy); // start as available
+    // Start Task 1: Camera + Trigger on Core 1, priority 2
+    xTaskCreatePinnedToCore(cameraTask, "CameraTask", 8192, NULL, 2, NULL, 1);
 
-    if (frameQueue == NULL || uploadBusy == NULL) {
-        Serial.println("Failed to create RTOS primitives! Restarting...");
-        delay(3000);
-        ESP.restart();
-    }
+    // Start Task 2: Polling on Core 0, priority 1
+    xTaskCreatePinnedToCore(pollTask, "PollTask", 8192, NULL, 1, NULL, 0);
 
-    xTaskCreatePinnedToCore(triggerTask,      "TriggerTask",  4096,  NULL, 2, NULL, 1);
-    xTaskCreatePinnedToCore(uploadTask,       "UploadTask",   16384, NULL, 1, NULL, 0);
-    xTaskCreatePinnedToCore(wifiWatchdogTask, "WiFiWatchdog", 4096,  NULL, 1, NULL, 0);
-
-    Serial.println("All tasks started. Ready.");
+    Serial.println("Setup complete. All tasks started.");
 }
 
+// ─── LOOP ─────────────────────────────────────────────
 void loop() {
+    // Tasks handle everything — loop does nothing
     vTaskDelay(pdMS_TO_TICKS(10000));
 }
