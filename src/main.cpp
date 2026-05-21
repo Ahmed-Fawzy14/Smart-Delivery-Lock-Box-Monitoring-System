@@ -30,6 +30,7 @@ const char* BLE_DEVICE_NAME = "SmartLockBox";
 #define WIFI_HEALTH_CHECK_MS      10000UL  // how often to ping the server in WiFi mode
 #define WIFI_RECOVERY_INTERVAL_MS 60000UL  // how often to re-check WiFi while in BLE mode
 #define WIFI_RECOVERY_TIMEOUT_MS  10000UL  // how long to wait for WiFi during a recovery attempt
+#define DECISION_TIMEOUT_MS       30000UL  // give up waiting for unlock decision after this long
 // ──────────────────────────────────────────────────────
 
 // ESP32-CAM AI-Thinker pin definitions
@@ -94,6 +95,13 @@ unsigned long latchOpenedAt = 0;
 unsigned long lastHealthCheck = 0;
 unsigned long firstWiFiFailureAt = 0;  // 0 means "currently healthy"
 unsigned long lastWiFiRecoveryAttempt = 0;
+
+// Decision timeout tracking
+unsigned long waitingForCommandStartedAt = 0;
+
+// Mutex to serialize HTTPS requests across tasks (prevents SSL heap exhaustion)
+SemaphoreHandle_t httpsMutex = nullptr;
+#define HTTPS_MUTEX_TIMEOUT_MS 5000UL
 
 // Forward declarations
 void initBLE();
@@ -309,21 +317,28 @@ bool connectWiFi(unsigned long timeoutMs) {
 bool checkServerReachable() {
     if (WiFi.status() != WL_CONNECTED) return false;
 
-    WiFiClientSecure client;
-    client.setInsecure();
-
-    HTTPClient http;
-    if (!http.begin(client, HEALTH_URL)) {
-        return false;
+    // Acquire HTTPS mutex to avoid concurrent TLS contexts
+    if (xSemaphoreTake(httpsMutex, pdMS_TO_TICKS(HTTPS_MUTEX_TIMEOUT_MS)) != pdTRUE) {
+        Serial.println("[Health] Could not acquire HTTPS mutex — skipping check.");
+        return true;  // assume healthy rather than triggering false-positive failure
     }
-    http.setTimeout(3000);
 
-    int code = http.GET();
-    http.end();
+    bool result = false;
+    {
+        WiFiClientSecure client;
+        client.setInsecure();
 
-    // Any HTTP response (even 4xx/5xx) means the server is reachable.
-    // Only negative codes (connection failures, DNS failures) count as "down".
-    return code > 0;
+        HTTPClient http;
+        if (http.begin(client, HEALTH_URL)) {
+            http.setTimeout(3000);
+            int code = http.GET();
+            http.end();
+            result = (code > 0);
+        }
+    }
+
+    xSemaphoreGive(httpsMutex);
+    return result;
 }
 
 // ─── MODE TRANSITIONS ─────────────────────────────────
@@ -507,7 +522,23 @@ bool captureAndSend() {
     String timestamp = getTimestamp();
     Serial.printf("[%s] Capturing image...\n", timestamp.c_str());
 
+    // Turn on flash BEFORE discarding stale frames so the sensor
+    // adjusts exposure to the new lighting condition.
     digitalWrite(FLASH_LED_PIN, HIGH);
+    delay(100);  // brief settling time for flash + sensor exposure
+
+    // Discard up to 2 stale frames that were captured before the flash.
+    // With fb_count=1, the camera continuously fills the buffer in the background,
+    // so the first fb_get() returns whatever frame was completed most recently
+    // (likely from before we pressed the trigger).
+    for (int i = 0; i < 2; i++) {
+        camera_fb_t* stale = esp_camera_fb_get();
+        if (stale) {
+            esp_camera_fb_return(stale);
+        }
+    }
+
+    // Now grab the actual fresh frame we want
     camera_fb_t* fb = esp_camera_fb_get();
     digitalWrite(FLASH_LED_PIN, LOW);
 
@@ -517,34 +548,67 @@ bool captureAndSend() {
     }
 
     Serial.printf("[Camera] Captured image: %d bytes\n", fb->len);
+    Serial.printf("[Memory] Free heap before upload: %u bytes\n", ESP.getFreeHeap());
 
-    WiFiClientSecure client;
-    client.setInsecure();
+    // Copy image data to our own buffer, then immediately release the camera framebuffer.
+    // This frees ~50-80KB of internal RAM that camera was holding, which is critical
+    // for the TLS handshake (mbedTLS needs ~30-50KB of contiguous heap).
+    size_t imgLen = fb->len;
+    uint8_t* imgBuf = (uint8_t*)malloc(imgLen);
+    if (!imgBuf) {
+        Serial.println("[Upload] Failed to allocate image buffer — aborting.");
+        esp_camera_fb_return(fb);
+        return false;
+    }
+    memcpy(imgBuf, fb->buf, imgLen);
+    esp_camera_fb_return(fb);
+    fb = nullptr;
 
-    HTTPClient http;
-    http.begin(client, SERVER_URL);
-    http.addHeader("Content-Type", "image/jpeg");
-    http.addHeader("X-Timestamp", timestamp);
-    http.setTimeout(30000);
+    Serial.printf("[Memory] Free heap after fb release: %u bytes\n", ESP.getFreeHeap());
 
-    int httpCode = http.POST(fb->buf, fb->len);
-
-    bool success = false;
-    if (httpCode == 200) {
-        Serial.printf("[HTTP] Image sent successfully! [%s]\n", timestamp.c_str());
-        success = true;
-    } else if (httpCode > 0) {
-        Serial.printf("[HTTP] POST failed, code: %d\n", httpCode);
-    } else {
-        Serial.printf("[HTTP] POST error: %s\n", http.errorToString(httpCode).c_str());
+    // Acquire mutex so we don't run TLS concurrently with the health check
+    if (xSemaphoreTake(httpsMutex, pdMS_TO_TICKS(HTTPS_MUTEX_TIMEOUT_MS)) != pdTRUE) {
+        Serial.println("[Upload] Could not acquire HTTPS mutex — aborting.");
+        free(imgBuf);
+        return false;
     }
 
-    http.end();
-    esp_camera_fb_return(fb);
+    bool success = false;
+    int httpCode = 0;
+
+    {
+        WiFiClientSecure client;
+        client.setInsecure();
+
+        HTTPClient http;
+        http.begin(client, SERVER_URL);
+        http.addHeader("Content-Type", "image/jpeg");
+        http.addHeader("X-Timestamp", timestamp);
+        http.setTimeout(30000);
+
+        httpCode = http.POST(imgBuf, imgLen);
+
+        if (httpCode == 200) {
+            Serial.printf("[HTTP] Image sent successfully! [%s]\n", timestamp.c_str());
+            success = true;
+        } else if (httpCode > 0) {
+            Serial.printf("[HTTP] POST failed, code: %d\n", httpCode);
+        } else {
+            Serial.printf("[HTTP] POST error: %s\n", http.errorToString(httpCode).c_str());
+        }
+
+        http.end();
+    }
+
+    xSemaphoreGive(httpsMutex);
+    free(imgBuf);
+
+    Serial.printf("[Memory] Free heap after upload: %u bytes\n", ESP.getFreeHeap());
 
     if (success) {
         Serial.println("[Command] Waiting for decision via HTTP poll...");
         waitingForCommand = true;
+        waitingForCommandStartedAt = millis();
     }
 
     return success;
@@ -563,7 +627,16 @@ void cameraTask(void* pvParameters) {
         }
 
         if (triggerPressedEvent()) {
-            Serial.println("[CameraTask] Trigger detected.");
+            Serial.println();
+            Serial.println("[CameraTask] >>> Trigger detected <<<");
+
+            // Log current state so user can see what's being interrupted
+            if (latchIsOpen) {
+                Serial.println("[CameraTask] Note: latch is currently open — capturing anyway.");
+            }
+            if (waitingForCommand) {
+                Serial.println("[CameraTask] Note: was waiting for previous decision — resetting and starting new capture.");
+            }
 
             if (currentMode == MODE_WIFI) {
                 waitingForCommand = false;
@@ -639,7 +712,26 @@ void pollTask(void* pvParameters) {
 
             // ─── Poll for HTTP unlock decision ────────
             if (waitingForCommand && WiFi.status() == WL_CONNECTED) {
-                Serial.println("[PollTask] Checking for decision...");
+                // Check if we've been waiting too long
+                unsigned long waitedFor = millis() - waitingForCommandStartedAt;
+                if (waitedFor >= DECISION_TIMEOUT_MS) {
+                    Serial.printf("[PollTask] ⏱ Decision timeout after %lu sec — clearing wait flag. Trigger is re-armed.\n",
+                                  waitedFor / 1000);
+                    waitingForCommand = false;
+                    vTaskDelay(pdMS_TO_TICKS(500));
+                    continue;
+                }
+
+                Serial.printf("[PollTask] Checking for decision... (%lu sec elapsed, %lu sec until timeout)\n",
+                              waitedFor / 1000,
+                              (DECISION_TIMEOUT_MS - waitedFor) / 1000);
+
+                // Acquire HTTPS mutex
+                if (xSemaphoreTake(httpsMutex, pdMS_TO_TICKS(HTTPS_MUTEX_TIMEOUT_MS)) != pdTRUE) {
+                    Serial.println("[PollTask] Could not acquire HTTPS mutex — will retry.");
+                    vTaskDelay(pdMS_TO_TICKS(1000));
+                    continue;
+                }
 
                 WiFiClientSecure client;
                 client.setInsecure();
@@ -670,6 +762,7 @@ void pollTask(void* pvParameters) {
                 }
 
                 http.end();
+                xSemaphoreGive(httpsMutex);
                 vTaskDelay(pdMS_TO_TICKS(2000));
             } else {
                 vTaskDelay(pdMS_TO_TICKS(500));
@@ -714,6 +807,11 @@ void setup() {
 
     initLatch();
     initTriggerInput();
+
+    httpsMutex = xSemaphoreCreateMutex();
+    if (httpsMutex == nullptr) {
+        safeRestart("Failed to create HTTPS mutex", 5000);
+    }
 
     rtcAvailable = initRTC();
     if (!rtcAvailable) {
