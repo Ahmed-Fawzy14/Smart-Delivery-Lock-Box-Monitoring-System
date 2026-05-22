@@ -1,0 +1,48 @@
+{
+  "project_info": {
+    "project_number": "244966456926",
+    "project_id": "smart-delivery-system-e504f",
+    "storage_bucket": "smart-delivery-system-e504f.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:244966456926:android:0c6def28331103f498fecf",
+        "android_client_info": {
+          "package_name": "com.example.smartDeliveryApp"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyCNckG3thev_emBXKdAXlkpg2AvMDV1x48"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    },
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:244966456926:android:24a99403c1d5ba1f98fecf",
+        "android_client_info": {
+          "package_name": "com.example.smart_delivery_app"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyCNckG3thev_emBXKdAXlkpg2AvMDV1x48"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
